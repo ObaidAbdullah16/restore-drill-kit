@@ -1,0 +1,101 @@
+{
+  "kind": "local",
+  "source": "local source",
+  "target": "drill_20261024_182149",
+  "restore_point": "2026-10-24T18:21:48+00:00",
+  "started_at": "2026-10-24T18:21:49+00:00",
+  "phases_seconds": {
+    "restore (pg_restore)": 0.2,
+    "verify data": 0.1
+  },
+  "rto_seconds": 0.3,
+  "rpo_seconds": 1.2,
+  "rto_target_seconds": 300.0,
+  "rpo_target_seconds": 86400.0,
+  "data_ok": true,
+  "rto_ok": true,
+  "rpo_ok": true,
+  "passed": true,
+  "checks": [
+    {
+      "name": "row count: customers",
+      "ok": true,
+      "expected": "5000",
+      "actual": "5000"
+    },
+    {
+      "name": "row count: orders",
+      "ok": true,
+      "expected": "14791",
+      "actual": "14791"
+    },
+    {
+      "name": "row count: order_items",
+      "ok": true,
+      "expected": "37101",
+      "actual": "37101"
+    },
+    {
+      "name": "row count: payments",
+      "ok": true,
+      "expected": "12802",
+      "actual": "12802"
+    },
+    {
+      "name": "checksum: customers",
+      "ok": true,
+      "expected": "4175751ff090",
+      "actual": "4175751ff090"
+    },
+    {
+      "name": "checksum: orders",
+      "ok": true,
+      "expected": "d61333150d20",
+      "actual": "d61333150d20"
+    },
+    {
+      "name": "checksum: order_items",
+      "ok": true,
+      "expected": "e70841fc0112",
+      "actual": "e70841fc0112"
+    },
+    {
+      "name": "checksum: payments",
+      "ok": true,
+      "expected": "13d63cd5af74",
+      "actual": "13d63cd5af74"
+    },
+    {
+      "name": "no orphans: orders.customer_id",
+      "ok": true,
+      "expected": "0",
+      "actual": "0"
+    },
+    {
+      "name": "no orphans: order_items.order_id",
+      "ok": true,
+      "expected": "0",
+      "actual": "0"
+    },
+    {
+      "name": "no orphans: payments.order_id",
+      "ok": true,
+      "expected": "0",
+      "actual": "0"
+    },
+    {
+      "name": "business query: total paid revenue",
+      "ok": true,
+      "expected": "164470639.48",
+      "actual": "164470639.48"
+    },
+    {
+      "name": "paid orders have a payment",
+      "ok": true,
+      "expected": "0",
+      "actual": "0"
+    }
+  ],
+  "notes": [],
+  "synthetic_data": true
+}

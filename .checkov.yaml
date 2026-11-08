@@ -1,0 +1,22 @@
+# Checks skipped on purpose for a short-lived demo environment. Each one is a
+# conscious cost/benefit decision, not an oversight - and each is listed in the
+# README as "what I would add for a client".
+skip-check:
+  - CKV_AWS_353   # Performance Insights: extra cost, the instance lives for minutes
+  - CKV_AWS_118   # Enhanced monitoring: needs a monitoring role + CloudWatch cost
+  - CKV_AWS_129   # RDS log exports: the log group would outlive `down` with no retention
+  - CKV2_AWS_30   # Postgres query logging: same as above
+  - CKV_AWS_394   # AZ pinning: the demo picks the first two AZs on purpose
+  - CKV2_AWS_62   # S3 event notifications: nothing consumes them
+  - CKV2_AWS_11   # VPC flow logs: cost; the VPC has no workloads besides the demo DB
+  - CKV_AWS_18    # S3 access logging: needs a second bucket for a tiny manifests bucket
+  - CKV_AWS_144   # S3 cross-region replication: manifests are re-created on every `up`
+  - CKV_AWS_145   # SSE-KMS: SSE-S3 is enough for synthetic data and avoids KMS key cost
+  - CKV_AWS_17    # Public RDS: demo only; access is opened for one IP during the drill
+  - CKV_AWS_157   # Multi-AZ: doubles the cost of a throwaway instance
+  - CKV_AWS_293   # Deletion protection: `down` must be able to delete the instance
+  - CKV_AWS_133   # Backup retention >= 7 days: 1 day is enough for the demo (the isolation report flags it)
+  - CKV_AWS_226   # Auto minor upgrades: already enabled
+  - CKV_AWS_354   # PI KMS key: Performance Insights is off
+  - CKV_AWS_337   # SSM parameter with customer KMS key: aws/ssm key is fine for a demo password
+  - CKV_AWS_130   # Public IPs in subnets: RDS needs public subnets for the from-your-laptop demo
