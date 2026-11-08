@@ -100,6 +100,15 @@ def backup_local(conninfo: str, out_dir: str, label: str = "local") -> tuple[Pat
     return dump, mpath
 
 
+def _client_major(tool: str) -> int | None:
+    """Major version of a PostgreSQL client tool ("pg_restore (PostgreSQL) 16.4" -> 16)."""
+    try:
+        out = subprocess.run([_need(tool), "--version"], check=True, capture_output=True, text=True).stdout
+        return int(out.split()[-1].split(".")[0])
+    except (OSError, RuntimeError, ValueError, IndexError, subprocess.CalledProcessError):
+        return None
+
+
 def latest_backup(path: str) -> tuple[Path, Path]:
     p = Path(path)
     if p.is_dir():
@@ -122,6 +131,12 @@ def drill_local(backup: str, sandbox_conninfo: str, keep: bool = False,
     admin = make_conninfo(sandbox_conninfo, dbname="postgres")
     with psycopg.connect(admin, autocommit=True) as conn:
         conn.execute(f'CREATE DATABASE "{dbname}"')
+        server_major = conn.info.server_version // 10000
+    client_major = _client_major("pg_restore")
+    if client_major and client_major > server_major:
+        # e.g. pg_dump 17+ writes "SET transaction_timeout", which PostgreSQL 16 rejects
+        res.notes.append(f"pg_restore {client_major} is newer than the sandbox server (PostgreSQL {server_major}): "
+                         f"if the restore fails, use the version {server_major} client tools (postgresql-client-{server_major})")
     target = make_conninfo(sandbox_conninfo, dbname=dbname)
     res.rpo_seconds = (start - dt.datetime.fromisoformat(manifest.captured_at)).total_seconds()
     try:

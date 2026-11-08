@@ -15,7 +15,7 @@ concurrency:
 jobs:
   test-and-drill:
     name: Tests + a real restore drill
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       prod:
@@ -65,7 +65,7 @@ jobs:
           path: reports/ci/
 
   iac-and-scripts:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -78,7 +78,7 @@ jobs:
         with:
           terraform_version: "<1.18.0"
           terraform_wrapper: false
-      - run: pip install checkov shellcheck-py actionlint-py
+      - run: pip install -r .github/requirements-ci.txt
       - run: shellcheck -x -P SCRIPTDIR scripts/*.sh
       - run: terraform fmt -check -recursive infra
       - run: |
