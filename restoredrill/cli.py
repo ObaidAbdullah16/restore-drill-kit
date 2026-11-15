@@ -98,7 +98,14 @@ def cmd_rds_drill(a: argparse.Namespace) -> int:
     manifest = load_manifest(a.manifest, session.client("s3"))
     res = drill_rds(session, a.source_id, a.sg_id, a.subnet_group, manifest, _password(a, session), mode=a.mode,
                     instance_class=a.instance_class, keep=a.keep, rto_target=a.rto_target, rpo_target=a.rpo_target)
-    iso = check_isolation(session, a.source_id, a.copy_region, a.app_role_arn) if a.with_isolation else None
+    iso = None
+    if a.with_isolation:
+        from .drill import retry
+        try:
+            iso = retry(lambda: check_isolation(session, a.source_id, a.copy_region, a.app_role_arn))
+        except Exception as e:  # noqa: BLE001 - the restore already ran: never lose its report over this
+            res.notes.append(f"isolation checks skipped: {e}")
+            print(f"warning: isolation checks skipped ({e}); writing the drill report anyway", file=sys.stderr)
     _print_result(res, write_all(res, a.report, iso))
     return 0 if res.passed else 1
 
@@ -191,7 +198,11 @@ def main(argv: list[str] | None = None) -> int:
     c.set_defaults(func=cmd_cleanup)
 
     a = ap.parse_args(argv)
-    return a.func(a)
+    try:
+        return a.func(a)
+    except RuntimeError as e:   # problems we explain ourselves: one line, no traceback
+        print(f"restoredrill: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

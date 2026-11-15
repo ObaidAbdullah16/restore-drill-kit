@@ -40,6 +40,17 @@ tf_init() {
     -backend-config="region=${AWS_REGION}" \
     -backend-config="use_lockfile=true" \
     -backend-config="encrypt=true" >/dev/null
+  # A run that lost its AWS login half-way leaves errored.tfstate behind: upload it first, or
+  # Terraform would work from the older state in S3.
+  if [[ -f "$dir/errored.tfstate" ]]; then
+    printf '[state] Uploading the state an interrupted run could not save (errored.tfstate)\n' >&2
+    if terraform -chdir="$dir" state push errored.tfstate; then
+      mv "$dir/errored.tfstate" "$dir/errored.tfstate.uploaded-$(date +%Y%m%d-%H%M%S)"
+    else
+      printf '[state] Could not upload %s/errored.tfstate - if the state is locked, see the guide: "Error acquiring the state lock"\n' "$dir" >&2
+      return 1
+    fi
+  fi
 }
 
 tf_apply() { # tf_apply <dir> [extra args...]

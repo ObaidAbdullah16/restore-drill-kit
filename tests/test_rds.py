@@ -131,3 +131,114 @@ def test_public_and_shared_snapshots_are_not_backups(aws):
     assert found["public snapshots"].status == "fail" and "leaky" in found["public snapshots"].detail
     # sharing is reported, but it is not a copy, so it can't "pass"
     assert found["copy in another account"].status == "info"
+
+
+# ------------------------------------------------------------------ AWS Free plan, retries, partial failures
+class _Waiter:
+    def __init__(self, log):
+        self.log = log
+
+    def wait(self, DBInstanceIdentifier, WaiterConfig):  # noqa: N803 - boto3 argument name
+        self.log.append(DBInstanceIdentifier)
+
+
+class _FakeRDS:
+    """Just enough RDS for the code paths moto cannot reach ('deleting' state, Free-plan quota)."""
+
+    def __init__(self, instances):
+        self.instances, self.waited, self.deleted = instances, [], []
+
+    def describe_db_instances(self, DBInstanceIdentifier=None):  # noqa: N803
+        found = [i for i in self.instances if DBInstanceIdentifier in (None, i["DBInstanceIdentifier"])]
+        return {"DBInstances": found}
+
+    def delete_db_instance(self, DBInstanceIdentifier, **kw):  # noqa: N803
+        self.deleted.append(DBInstanceIdentifier)
+
+    def get_waiter(self, name):
+        return _Waiter(self.waited)
+
+    def describe_db_snapshots(self, DBInstanceIdentifier):  # noqa: N803
+        return {"DBSnapshots": [{"DBSnapshotIdentifier": "s1", "Status": "available",
+                                 "SnapshotCreateTime": dt.datetime(2026, 11, 15, tzinfo=dt.timezone.utc)}]}
+
+    def restore_db_instance_from_db_snapshot(self, **kw):
+        from botocore.exceptions import ClientError
+        raise ClientError({"Error": {"Code": "InstanceQuotaExceeded", "Message": "free plan"}}, "RestoreDBInstanceFromDBSnapshot")
+
+
+class _FakeSession:
+    def __init__(self, rds):
+        self.rds = rds
+
+    def client(self, name):
+        return self.rds
+
+
+def _inst(name, status, sandbox):
+    tags = [{"Key": TAG_KEY, "Value": "sandbox"}] if sandbox else []
+    return {"DBInstanceIdentifier": name, "DBInstanceStatus": status, "TagList": tags, "MasterUsername": "drill"}
+
+
+def test_old_sandboxes_are_removed_before_a_new_restore():
+    from restoredrill.drill import clear_old_sandboxes
+    rds = _FakeRDS([_inst("prod", "available", False), _inst("prod-sandbox-1", "deleting", True),
+                    _inst("other-db", "available", False), _inst("prod-sandbox-2", "available", True)])
+    assert clear_old_sandboxes(rds) == ["prod-sandbox-1", "prod-sandbox-2"]
+    assert rds.deleted == ["prod-sandbox-2"], "a leftover sandbox is deleted; one already deleting is not asked again"
+    assert rds.waited == ["prod-sandbox-1", "prod-sandbox-2"], "and the drill waits until both are gone"
+    assert "prod" not in rds.deleted and "other-db" not in rds.deleted, "never touches other databases"
+
+
+def test_free_plan_instance_quota_is_explained():
+    m = Manifest(captured_at="2026-11-15T00:00:00+00:00", source="prod")
+    alone = _FakeRDS([_inst("prod", "available", False)])
+    with pytest.raises(RuntimeError, match="may not run a second database"):
+        drill_rds(_FakeSession(alone), "prod", "sg-1", "drill", m, "pw")
+    crowded = _FakeRDS([_inst("prod", "available", False), _inst("shipit-db", "available", False)])
+    with pytest.raises(RuntimeError, match=r"Besides prod there is: shipit-db \(available\)"):
+        drill_rds(_FakeSession(crowded), "prod", "sg-1", "drill", m, "pw")
+
+
+def test_retry_repeats_network_and_credential_errors_only():
+    from botocore.exceptions import CredentialRetrievalError, EndpointConnectionError
+
+    from restoredrill.drill import retry
+    calls, slept = [], []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise EndpointConnectionError(endpoint_url="https://ap-southeast-2.signin.aws.amazon.com/v1/token")
+        return "ok"
+
+    assert retry(flaky, sleep=slept.append) == "ok" and len(slept) == 2
+    with pytest.raises(CredentialRetrievalError):
+        retry(lambda: (_ for _ in ()).throw(CredentialRetrievalError(provider="custom-process", error_msg="x")),
+              attempts=2, sleep=slept.append)
+    with pytest.raises(ValueError):
+        retry(lambda: (_ for _ in ()).throw(ValueError("not transient")), sleep=slept.append)
+
+
+def test_report_is_written_even_if_the_isolation_check_fails(monkeypatch, tmp_path):
+    import restoredrill.cli as cli
+    import restoredrill.drill as drill
+    import restoredrill.isolation as isolation
+    from restoredrill.drill import DrillResult
+
+    res = DrillResult(kind="rds-snapshot", source="snapshot s1", restore_point="2026-11-15T00:00:00+00:00",
+                      started_at="2026-11-15T01:00:00+00:00", checks=[CheckResult("row count: customers", True, "10", "10")])
+
+    def broken(*a, **k):
+        raise RuntimeError("Could not connect to the endpoint URL")
+
+    monkeypatch.setattr(cli, "_session", lambda region: None)
+    monkeypatch.setattr(cli, "_password", lambda a, s: "pw")
+    monkeypatch.setattr(drill, "load_manifest", lambda uri, s3: Manifest(captured_at="x", source="prod"))
+    monkeypatch.setattr(drill, "drill_rds", lambda *a, **k: res)
+    monkeypatch.setattr(isolation, "check_isolation", broken)
+    monkeypatch.setattr(cli, "_session", lambda region: _FakeSession(None))
+    rc = cli.main(["rds-drill", "--source-id", "prod", "--sg-id", "sg-1", "--subnet-group", "g", "--manifest", "s3://b/m.json",
+                   "--with-isolation", "--report", str(tmp_path / "r")])
+    assert rc == 0 and (tmp_path / "r" / "report.html").exists()
+    assert any("isolation checks skipped" in n for n in res.notes)

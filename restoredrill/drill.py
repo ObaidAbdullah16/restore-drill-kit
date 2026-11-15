@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from collections.abc import Callable
@@ -13,6 +14,14 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    CredentialRetrievalError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from psycopg.conninfo import make_conninfo
 
 from .dataset import Manifest, capture
@@ -166,6 +175,67 @@ def drill_local(backup: str, sandbox_conninfo: str, keep: bool = False,
 
 TAG_KEY = "restore-drill"
 
+# Errors that usually go away a moment later: a network blip, or `aws login` failing to refresh its
+# 15-minute credentials while the connection is down ("Could not connect to the endpoint URL").
+TRANSIENT = (EndpointConnectionError, ConnectTimeoutError, ReadTimeoutError, ConnectionClosedError,
+             CredentialRetrievalError)
+
+def quota_message(rds: Any, source_id: str) -> str:
+    """Explain InstanceQuotaExceeded with the databases that are actually there."""
+    try:
+        insts = [(i["DBInstanceIdentifier"], i["DBInstanceStatus"]) for i in rds.describe_db_instances()["DBInstances"]]
+    except Exception:  # noqa: BLE001 - the explanation must not fail
+        insts = []
+    others = [f"{n} ({st})" for n, st in insts if n != source_id]
+    if insts and not others:
+        return (f"RDS refused to create the sandbox although {source_id} is the only database in this account: "
+                "on the AWS Free plan this account may not run a second database at the same time, and an RDS drill "
+                "needs two (the database and its restored copy). Use the free local drill (bash scripts/local-drill.sh), "
+                "or upgrade the account to the Paid plan (unused credits keep applying).")
+    return ("RDS refused to create the sandbox: the account already has as many databases as the AWS Free plan allows. "
+            f"Besides {source_id} there is: {', '.join(others) or 'see the RDS console'}. Delete the ones you do not need "
+            "(for example a database another project left running), then run the drill again.")
+
+
+def retry(fn: Callable[[], Any], attempts: int = 4, delay: float = 15.0,
+          sleep: Callable[[float], None] = time.sleep) -> Any:
+    """Run fn, retrying TRANSIENT errors (network, credential refresh) a few times."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except TRANSIENT as e:
+            if i == attempts - 1:
+                raise
+            print(f"[retry] {type(e).__name__}: {e} - trying again in {delay:.0f}s", file=sys.stderr, flush=True)
+            sleep(delay)
+    return None
+
+
+def clear_old_sandboxes(rds: Any) -> list[str]:
+    """Remove what earlier drills left behind before restoring a new sandbox. On the AWS Free plan only a
+    couple of databases may exist at once, and a leftover sandbox (a kept one, or one a network drop
+    stopped the drill from deleting) or one that is still being deleted counts. Only instances tagged as
+    this kit's sandboxes are touched - never the source database."""
+    pending: list[str] = []
+    for inst in rds.describe_db_instances()["DBInstances"]:
+        if {t["Key"]: t["Value"] for t in inst.get("TagList", [])}.get(TAG_KEY) != "sandbox":
+            continue
+        name, status = inst["DBInstanceIdentifier"], inst.get("DBInstanceStatus", "")
+        if status != "deleting":
+            print(f"Deleting {name}, a sandbox an earlier drill left behind ({status})", file=sys.stderr, flush=True)
+            try:
+                retry(lambda n=name: rds.delete_db_instance(DBInstanceIdentifier=n, SkipFinalSnapshot=True,
+                                                            DeleteAutomatedBackups=True))
+            except ClientError as e:
+                raise RuntimeError(f"Could not delete the old sandbox {name} ({status}): {e}. If another drill is "
+                                   "still running, let it finish; otherwise delete it in the RDS console.") from e
+        pending.append(name)
+    for name in pending:
+        print(f"Waiting for the old sandbox {name} to be deleted (usually 5-10 minutes)", file=sys.stderr, flush=True)
+        retry(lambda n=name: rds.get_waiter("db_instance_deleted").wait(
+            DBInstanceIdentifier=n, WaiterConfig={"Delay": 30, "MaxAttempts": 60}))
+    return pending
+
 
 def my_ip() -> str:
     with urllib.request.urlopen("https://checkip.amazonaws.com", timeout=10) as r:
@@ -230,6 +300,7 @@ def drill_rds(session: Any, source_id: str, sg_id: str, subnet_group: str, manif
               verifier: Callable[[str, Manifest], list[CheckResult]] = verify,
               ingress_ip: str | None = None) -> DrillResult:
     rds, ec2 = session.client("rds"), session.client("ec2")
+    clear_old_sandboxes(rds)   # before the clock starts: not part of the restore time
     t0 = time.monotonic()
     start = utcnow()
     sandbox = f"{source_id}-sandbox-{start:%m%d%H%M%S}"
@@ -237,20 +308,25 @@ def drill_rds(session: Any, source_id: str, sg_id: str, subnet_group: str, manif
                   PubliclyAccessible=True, MultiAZ=False, DeletionProtection=False,
                   Tags=[{"Key": TAG_KEY, "Value": "sandbox"}])
     src = rds.describe_db_instances(DBInstanceIdentifier=source_id)["DBInstances"][0]
-    if mode == "pitr":
-        point = src["LatestRestorableTime"]
-        rds.restore_db_instance_to_point_in_time(SourceDBInstanceIdentifier=source_id, TargetDBInstanceIdentifier=sandbox,
-                                                 UseLatestRestorableTime=True, **common)
-        source_desc = f"{source_id} at latest restorable time"
-    else:
-        snaps = rds.describe_db_snapshots(DBInstanceIdentifier=source_id)["DBSnapshots"]
-        snaps = [s for s in snaps if s.get("Status") == "available"]
-        if not snaps:
-            raise RuntimeError(f"no available snapshots for {source_id}")
-        snap = max(snaps, key=lambda s: s["SnapshotCreateTime"])
-        point = snap["SnapshotCreateTime"]
-        rds.restore_db_instance_from_db_snapshot(DBInstanceIdentifier=sandbox, DBSnapshotIdentifier=snap["DBSnapshotIdentifier"], **common)
-        source_desc = f"snapshot {snap['DBSnapshotIdentifier']}"
+    try:
+        if mode == "pitr":
+            point = src["LatestRestorableTime"]
+            rds.restore_db_instance_to_point_in_time(SourceDBInstanceIdentifier=source_id, TargetDBInstanceIdentifier=sandbox,
+                                                     UseLatestRestorableTime=True, **common)
+            source_desc = f"{source_id} at latest restorable time"
+        else:
+            snaps = rds.describe_db_snapshots(DBInstanceIdentifier=source_id)["DBSnapshots"]
+            snaps = [s for s in snaps if s.get("Status") == "available"]
+            if not snaps:
+                raise RuntimeError(f"no available snapshots for {source_id}")
+            snap = max(snaps, key=lambda s: s["SnapshotCreateTime"])
+            point = snap["SnapshotCreateTime"]
+            rds.restore_db_instance_from_db_snapshot(DBInstanceIdentifier=sandbox, DBSnapshotIdentifier=snap["DBSnapshotIdentifier"], **common)
+            source_desc = f"snapshot {snap['DBSnapshotIdentifier']}"
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "InstanceQuotaExceeded":
+            raise RuntimeError(quota_message(rds, source_id)) from e
+        raise
     if point.tzinfo is None:
         point = point.replace(tzinfo=dt.timezone.utc)
     res = DrillResult(kind=f"rds-{mode}", source=source_desc, restore_point=point.isoformat(timespec="seconds"),
@@ -260,7 +336,8 @@ def drill_rds(session: Any, source_id: str, sg_id: str, subnet_group: str, manif
     try:
         t1 = t0
         try:
-            rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier=sandbox, WaiterConfig={"Delay": 30, "MaxAttempts": 90})
+            retry(lambda: rds.get_waiter("db_instance_available").wait(
+                DBInstanceIdentifier=sandbox, WaiterConfig={"Delay": 30, "MaxAttempts": 90}))
             t1 = time.monotonic()
             res.phases["restore (RDS provisioning)"] = t1 - t0
             inst = rds.describe_db_instances(DBInstanceIdentifier=sandbox)["DBInstances"][0]
@@ -276,10 +353,11 @@ def drill_rds(session: Any, source_id: str, sg_id: str, subnet_group: str, manif
         res.rto_seconds = t2 - t0
     finally:
         if keep:
-            res.notes.append(f"sandbox {sandbox} kept - delete it to stop paying (bash scripts/down.sh does)")
+            res.notes.append(f"sandbox {sandbox} kept - the next drill or bash scripts/down.sh deletes it")
         else:
             try:
-                rds.delete_db_instance(DBInstanceIdentifier=sandbox, SkipFinalSnapshot=True, DeleteAutomatedBackups=True)
+                retry(lambda: rds.delete_db_instance(DBInstanceIdentifier=sandbox, SkipFinalSnapshot=True,
+                                                     DeleteAutomatedBackups=True))
                 res.notes.append(f"sandbox {sandbox} deletion requested")
             except Exception as e:  # noqa: BLE001
                 res.notes.append(f"could not delete sandbox {sandbox}: {e} - run scripts/down.sh")
